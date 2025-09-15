@@ -47,6 +47,7 @@ pub const LeftToRight = struct {
         const line = dots.Scale.foot.translateXFrom(@as(f64, @floatFromInt((50 - self.yard_line) * 3)));
         const dx = dots.Scale.step.translateXFrom(self.steps);
         const x_abs = switch (self.direction) {
+            .on => line,
             // Numbers get smaller, closer to the origin.
             .inside => line - dx,
             // Numbers get bigger, farther from the origin.
@@ -59,7 +60,7 @@ pub const LeftToRight = struct {
     }
 
     pub const Side = enum { side1, side2 };
-    pub const Direction = enum { inside, outside };
+    pub const Direction = enum { on, inside, outside };
 };
 
 pub const FrontToBack = struct {
@@ -86,6 +87,7 @@ pub const FrontToBack = struct {
         };
         const dy = dots.Scale.step.translateYFrom(self.steps);
         return switch (self.direction) {
+            .on => marking_y,
             // Numbers get bigger.
             .behind => marking_y + dy,
             // Numbers get smaller.
@@ -93,7 +95,7 @@ pub const FrontToBack = struct {
         };
     }
 
-    pub const Direction = enum { behind, in_front_of };
+    pub const Direction = enum { on, behind, in_front_of };
     pub const Marking = enum { back_side_line, back_hash, front_hash, front_side_line };
 };
 
@@ -165,24 +167,21 @@ fn parseCounts(s: *std.Io.Reader) !usize {
     return try std.fmt.parseInt(usize, try s.takeDelimiterExclusive(' '), 10);
 }
 
-fn parseSide(s: *std.Io.Reader) !LeftToRight.Side {
+fn parseSide(s: *std.Io.Reader, ltr: *LeftToRight) !void {
     try skipWs(s);
     // Skip "Side"
     _ = try s.discardDelimiterExclusive(' ');
     try skipWs(s);
-    return switch (std.fmt.parseInt(usize, try s.takeDelimiterExclusive(':'), 10) catch return error.InvalidSide) {
+    ltr.side = switch (std.fmt.parseInt(usize, try s.takeDelimiterExclusive(':'), 10) catch return error.InvalidSide) {
         1 => .side1,
         2 => .side2,
-        else => error.SideOutOfRange,
+        else => return error.SideOutOfRange,
     };
 }
 
 fn parseSteps(s: *std.Io.Reader) !f64 {
     try skipWs(s);
     const token = try s.takeDelimiterExclusive(' ');
-    if (std.mem.eql(u8, token, "On") or std.mem.eql(u8, token, "on")) {
-        return 0;
-    }
     const steps = std.fmt.parseFloat(f64, token) catch return error.InvalidStepNumber;
     try skipWs(s);
     // Skip "steps"
@@ -190,43 +189,64 @@ fn parseSteps(s: *std.Io.Reader) !f64 {
     return steps;
 }
 
-fn parseLtrDirection(s: *std.Io.Reader) !LeftToRight.Direction {
+fn parseLtrDirection(s: *std.Io.Reader, ltr: *LeftToRight) !void {
+    try skipWs(s);
+    {
+        const token = try s.peekDelimiterExclusive(' ');
+        if (std.mem.eql(u8, token, "On") or std.mem.eql(u8, token, "on")) {
+            ltr.steps = 0;
+            ltr.direction = .on;
+            _ = try s.discard(.limited(token.len));
+            return;
+        }
+    }
+    ltr.steps = try parseSteps(s);
     try skipWs(s);
     const token = try s.takeDelimiterExclusive(' ');
     if (std.mem.eql(u8, token, "outside")) {
-        return .outside;
+        ltr.direction = .outside;
     } else if (std.mem.eql(u8, token, "inside")) {
-        return .inside;
+        ltr.direction = .inside;
     } else {
         return error.InvalidLeftToRightDirection;
     }
 }
 
-fn parseYardLine(s: *std.Io.Reader) !u32 {
+fn parseYardLine(s: *std.Io.Reader, ltr: *LeftToRight) !void {
     try skipWs(s);
-    const yard_line = std.fmt.parseInt(u32, try s.takeDelimiterExclusive(' '), 10) catch return error.InvalidYardLine;
+    ltr.yard_line = std.fmt.parseInt(u32, try s.takeDelimiterExclusive(' '), 10) catch return error.InvalidYardLine;
     try skipWs(s);
     // Skip "yd"
     _ = try s.discardDelimiterExclusive(' ');
     try skipWs(s);
     // Skip "ln"
     _ = try s.discardDelimiterExclusive(' ');
-    return yard_line;
 }
 
 fn parseLeftToRight(s: *std.Io.Reader) !LeftToRight {
-    const side = try parseSide(s);
-    const steps = try parseSteps(s);
-    const direction = try parseLtrDirection(s);
-    const yard_line = try parseYardLine(s);
-    return .{ .side = side, .direction = direction, .yard_line = yard_line, .steps = steps };
+    var result: LeftToRight = undefined;
+    try parseSide(s, &result);
+    try parseLtrDirection(s, &result);
+    try parseYardLine(s, &result);
+    return result;
 }
 
-fn parseFtbDirection(s: *std.Io.Reader) !FrontToBack.Direction {
+fn parseFtbDirection(s: *std.Io.Reader, ftb: *FrontToBack) !void {
+    try skipWs(s);
+    {
+        const token = try s.peekDelimiterExclusive(' ');
+        if (std.mem.eql(u8, token, "On") or std.mem.eql(u8, token, "on")) {
+            ftb.steps = 0;
+            ftb.direction = .on;
+            _ = try s.discard(.limited(token.len));
+            return;
+        }
+    }
+    ftb.steps = try parseSteps(s);
     try skipWs(s);
     const token = try s.takeDelimiterExclusive(' ');
     if (std.mem.eql(u8, token, "behind")) {
-        return .behind;
+        ftb.direction = .behind;
     } else if (std.mem.eql(u8, token, "in")) {
         // Discard "front"
         try skipWs(s);
@@ -234,14 +254,14 @@ fn parseFtbDirection(s: *std.Io.Reader) !FrontToBack.Direction {
         // Discard "of"
         try skipWs(s);
         _ = try s.discardDelimiterExclusive(' ');
-        return .in_front_of;
+        ftb.direction = .in_front_of;
     } else {
         std.debug.print("FTB Direction '{s}'\n", .{token});
         return error.InvalidFrontToBackDirection;
     }
 }
 
-fn parseMarking(s: *std.Io.Reader) !FrontToBack.Marking {
+fn parseMarking(s: *std.Io.Reader, ftb: *FrontToBack) !void {
     try skipWs(s);
     // Match
     //   Back side line
@@ -250,13 +270,13 @@ fn parseMarking(s: *std.Io.Reader) !FrontToBack.Marking {
     //   Front side line
     const token = try s.take(if (try s.peekByte() == 'B') 14 else 15);
     if (std.mem.eql(u8, token, "Back side line")) {
-        return .back_side_line;
+        ftb.marking = .back_side_line;
     } else if (std.mem.eql(u8, token, "Back Hash (HS)")) {
-        return .back_hash;
+        ftb.marking = .back_hash;
     } else if (std.mem.eql(u8, token, "Front Hash (HS)")) {
-        return .front_hash;
+        ftb.marking = .front_hash;
     } else if (std.mem.eql(u8, token, "Front side line")) {
-        return .front_side_line;
+        ftb.marking = .front_side_line;
     } else {
         std.debug.print("FTB marking '{s}'\n", .{token});
         return error.InvalidFrontToBackDirection;
@@ -264,52 +284,71 @@ fn parseMarking(s: *std.Io.Reader) !FrontToBack.Marking {
 }
 
 fn parseFrontToBack(s: *std.Io.Reader) !FrontToBack {
-    const steps = try parseSteps(s);
-    const direction = try parseFtbDirection(s);
-    const marking = try parseMarking(s);
-    return .{ .marking = marking, .direction = direction, .steps = steps };
+    var result: FrontToBack = undefined;
+    try parseFtbDirection(s, &result);
+    try parseMarking(s, &result);
+    return result;
 }
 
-fn parseCoordinate(s: *std.Io.Reader) !dots.Coordinate {
+pub const ParsedCoordinate = struct {
+    set: []const u8,
+    letter: ?[]const u8,
+    counts: usize,
+    ltr: LeftToRight,
+    ftb: FrontToBack,
+
+    pub fn canonical(self: ParsedCoordinate) dots.Coordinate {
+        return .{ .x = self.ltr.delta(), .y = self.ftb.delta() };
+    }
+};
+
+fn parseCoordinate(s: *std.Io.Reader) !ParsedCoordinate {
+    const set = try parseSet(s);
+    const letter = try parseLetter(s);
+    const counts = try parseCounts(s);
     const ltr = try parseLeftToRight(s);
     const ftb = try parseFrontToBack(s);
-    return .{ .x = ltr.delta(), .y = ftb.delta() };
+    return .{ .set = set, .letter = letter, .counts = counts, .ltr = ltr, .ftb = ftb };
 }
 
 test {
-    // TOKENS
-    //   Set
-    //   Letter ?
-    //   Counts
-    //   LTR
-    //     Side
-    //     Steps
-    //     Direction
-    //     Line
-    //   FTB
-    //     Steps
-    //     Direction
-    //     Marking
-    const line = "2 A 16 Side 1: 3.0 steps outside 50 yd ln 9.0 steps in front of Front Hash (HS)";
-    var s = std.io.Reader.fixed(line);
-
-    const set = try parseSet(&s);
-    try std.testing.expectEqualStrings("2", set);
-    const letter = try parseLetter(&s);
-    try std.testing.expectEqualStrings("A", letter.?);
-    const counts = try parseCounts(&s);
-    try std.testing.expectEqual(@as(usize, 16), counts);
-    const ltr = try parseLeftToRight(&s);
-    try std.testing.expectEqual(LeftToRight.Side.side1, ltr.side);
-    try std.testing.expectEqual(@as(f64, 3.0), ltr.steps);
-    try std.testing.expectEqual(LeftToRight.Direction.outside, ltr.direction);
-    try std.testing.expectEqual(@as(u32, 50), ltr.yard_line);
-    const ftb = try parseFrontToBack(&s);
-    try std.testing.expectEqual(@as(f64, 9.0), ftb.steps);
-    try std.testing.expectEqual(FrontToBack.Direction.in_front_of, ftb.direction);
-    try std.testing.expectEqual(FrontToBack.Marking.front_hash, ftb.marking);
-    // const coord = try parseCoordinate(&s);
-    // _ = coord;
+    for (&[_]std.meta.Tuple(&[_]type{ []const u8, ParsedCoordinate }){
+        .{
+            "2 A 16 Side 1: 3.0 steps outside 50 yd ln 9.0 steps in front of Front Hash (HS)",
+            ParsedCoordinate{
+                .set = "2",
+                .letter = "A",
+                .counts = 16,
+                .ltr = .{ .side = .side1, .steps = 3.0, .direction = .outside, .yard_line = 50 },
+                .ftb = .{ .steps = 9.0, .direction = .in_front_of, .marking = .front_hash },
+            },
+        },
+        .{
+            "3A 8 Side 2: On 45 yd ln On Back Hash (HS)",
+            ParsedCoordinate{
+                .set = "3A",
+                .letter = null,
+                .counts = 8,
+                .ltr = .{ .side = .side2, .steps = 0.0, .direction = .on, .yard_line = 45 },
+                .ftb = .{ .steps = 0.0, .direction = .on, .marking = .back_hash },
+            },
+        },
+    }) |t| {
+        const line = t[0];
+        const exp = t[1];
+        var s = std.io.Reader.fixed(line);
+        const act = try parseCoordinate(&s);
+        try std.testing.expectEqualStrings(exp.set, act.set);
+        try std.testing.expectEqualDeep(exp.letter, act.letter);
+        try std.testing.expectEqual(exp.counts, act.counts);
+        try std.testing.expectEqual(exp.ltr.side, act.ltr.side);
+        try std.testing.expectEqual(exp.ltr.steps, act.ltr.steps);
+        try std.testing.expectEqual(exp.ltr.direction, act.ltr.direction);
+        try std.testing.expectEqual(exp.ltr.yard_line, act.ltr.yard_line);
+        try std.testing.expectEqual(exp.ftb.steps, act.ftb.steps);
+        try std.testing.expectEqual(exp.ftb.direction, act.ftb.direction);
+        try std.testing.expectEqual(exp.ftb.marking, act.ftb.marking);
+    }
 }
 
 pub fn main() !void {
