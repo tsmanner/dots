@@ -1,32 +1,8 @@
 const std = @import("std");
 const dots = @import("dots");
+const xml = @import("xml.zig");
 
 const pixel = dots.Scale{ .ratio = .{ .x = 800, .y = -426 } };
-
-fn FmtAlt(comptime f: anytype) type {
-    return std.fmt.Alt(std.meta.fields(std.meta.ArgsTuple(@TypeOf(f)))[0].type, f);
-}
-
-fn fmtAlt(comptime f: anytype, d: anytype) FmtAlt(f) {
-    return .{ .data = d };
-}
-
-fn printLine(cs: [2]dots.Coordinate, writer: *std.io.Writer) std.io.Writer.Error!void {
-    try writer.print("<line x1=\"{}\" y1=\"{}\" x2=\"{}\" y2=\"{}\" stroke=\"black\"/>", .{ cs[0].x, cs[0].y, cs[1].x, cs[1].y });
-}
-
-fn printPerformer(p: dots.Performer, writer: *std.io.Writer) std.io.Writer.Error!void {
-    try writer.print("<text>{s}{}</text>\n", .{ p.section.symbol, p.number });
-}
-
-fn printDot(d: dots.Dot, writer: *std.io.Writer) std.io.Writer.Error!void {
-    try writer.print("<g>\n<circle r=\"2\" fill=\"black\"/>\n", .{});
-    try writer.print(
-        "<g transform=\"translate(14, 26)\">\n<line stroke=\"black\" x1=\"-10\" y1=\"-22\" x2=\"0\" y2=\"-12\"/>{f}\n",
-        .{fmtAlt(printPerformer, d.performer)},
-    );
-    try writer.print("</g>\n</g>\n", .{});
-}
 
 pub const LeftToRight = struct {
     side: Side,
@@ -44,6 +20,9 @@ pub const LeftToRight = struct {
     }
 
     pub fn delta(self: LeftToRight) f64 {
+        if (self.side == .middle) {
+            return 0;
+        }
         const line = dots.Scale.foot.translateXFrom(@as(f64, @floatFromInt((50 - self.yard_line) * 3)));
         const dx = dots.Scale.step.translateXFrom(self.steps);
         const x_abs = switch (self.direction) {
@@ -53,13 +32,18 @@ pub const LeftToRight = struct {
             // Numbers get bigger, farther from the origin.
             .outside => line + dx,
         };
-        return switch (self.side) {
-            .side1 => -x_abs,
-            .side2 => x_abs,
-        };
+        switch (self.side) {
+            // Never hit because if side is middle we return early.
+            .middle => {
+                @branchHint(.cold);
+                return 0;
+            },
+            .side1 => return -x_abs,
+            .side2 => return x_abs,
+        }
     }
 
-    pub const Side = enum { side1, side2 };
+    pub const Side = enum { middle, side1, side2 };
     pub const Direction = enum { on, inside, outside };
 };
 
@@ -133,10 +117,6 @@ test {
         try std.testing.expectApproxEqAbs(midfield.x, result.x, tolerance);
         try std.testing.expectApproxEqAbs(midfield.y, result.y, tolerance);
     }
-}
-
-pub fn dot(performer: dots.Performer, ltr: LeftToRight, ftb: FrontToBack) dots.Dot {
-    return .{ .performer = performer, .coordinate = .{ .x = ltr.delta(), .y = ftb.delta() } };
 }
 
 fn skipWs(s: *std.Io.Reader) !void {
@@ -225,9 +205,31 @@ fn parseYardLine(s: *std.Io.Reader, ltr: *LeftToRight) !void {
 
 fn parseLeftToRight(s: *std.Io.Reader) !LeftToRight {
     var result: LeftToRight = undefined;
-    try parseSide(s, &result);
-    try parseLtrDirection(s, &result);
-    try parseYardLine(s, &result);
+    try skipWs(s);
+    const token = try s.peekDelimiterExclusive(' ');
+    if (std.mem.eql(u8, token, "Side")) {
+        try parseSide(s, &result);
+        try parseLtrDirection(s, &result);
+        try parseYardLine(s, &result);
+        if (result.direction == .on and result.yard_line == 50) {
+            result.side = .middle;
+        }
+    } else {
+        result.side = .middle;
+        try parseLtrDirection(s, &result);
+        try parseYardLine(s, &result);
+        // Make sure the rest of the coordinate makes sense.
+        if (result.direction != .on) {
+            std.debug.print("Direction: {}\n", .{result.direction});
+            return error.MissingSideWithDirection;
+        } else if (result.yard_line != 50) {
+            std.debug.print("Yard Line: {}\n", .{result.yard_line});
+            return error.MissingSideWithYardLine;
+        } else if (!std.math.approxEqAbs(f64, result.steps, 0.0, 0.00001)) {
+            std.debug.print("Steps: {}\n", .{result.steps});
+            return error.MissingSideWithSteps;
+        }
+    }
     return result;
 }
 
@@ -311,7 +313,23 @@ fn parseCoordinate(s: *std.Io.Reader) !ParsedCoordinate {
     return .{ .set = set, .letter = letter, .counts = counts, .ltr = ltr, .ftb = ftb };
 }
 
-test {
+/// Caller owns the memory.
+fn parseCoordinates(allocator: std.mem.Allocator, s: *std.Io.Reader) ![]ParsedCoordinate {
+    var coordinates: std.ArrayList(ParsedCoordinate) = .empty;
+    while (true) {
+        try coordinates.append(allocator, parseCoordinate(s) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        });
+        skipWs(s) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+    }
+    return coordinates.toOwnedSlice(allocator);
+}
+
+test parseCoordinate {
     for (&[_]std.meta.Tuple(&[_]type{ []const u8, ParsedCoordinate }){
         .{
             "2 A 16 Side 1: 3.0 steps outside 50 yd ln 9.0 steps in front of Front Hash (HS)",
@@ -338,16 +356,91 @@ test {
         const exp = t[1];
         var s = std.io.Reader.fixed(line);
         const act = try parseCoordinate(&s);
-        try std.testing.expectEqualStrings(exp.set, act.set);
-        try std.testing.expectEqualDeep(exp.letter, act.letter);
-        try std.testing.expectEqual(exp.counts, act.counts);
-        try std.testing.expectEqual(exp.ltr.side, act.ltr.side);
-        try std.testing.expectEqual(exp.ltr.steps, act.ltr.steps);
-        try std.testing.expectEqual(exp.ltr.direction, act.ltr.direction);
-        try std.testing.expectEqual(exp.ltr.yard_line, act.ltr.yard_line);
-        try std.testing.expectEqual(exp.ftb.steps, act.ftb.steps);
-        try std.testing.expectEqual(exp.ftb.direction, act.ftb.direction);
-        try std.testing.expectEqual(exp.ftb.marking, act.ftb.marking);
+        try std.testing.expectEqualDeep(exp, act);
+    }
+}
+
+test parseCoordinates {
+    var s = std.Io.Reader.fixed(
+        \\0 0 Side 1: On 40 yd ln On Front Hash (HS)
+        \\1 A 72 Side 1: On 40 yd ln On Front Hash (HS)
+        \\2 16 Side 1: 3.0 steps outside 50 yd ln 9.0 steps in front of Front Hash (HS)
+        \\3B 24 Side 1: On 40 yd ln 1.0 steps behind Front side line
+        \\4 C 16 Side 1: 2.25 steps inside 30 yd ln 3.75 steps behind Front side line
+        \\5 8 Side 1: 1.75 steps inside 35 yd ln 0.75 steps in front of Front side line
+        \\7A 8 Side 1: On 50 yd ln 4.0 steps behind Front side line
+        \\8 10 Side 2: 1.5 steps inside 45 yd ln 6.25 steps behind Front side line
+        \\16 16 On 50 yd ln 1.0 steps behind Front side line
+    );
+    const acts = try parseCoordinates(std.testing.allocator, &s);
+    defer std.testing.allocator.free(acts);
+    const exps: []const ParsedCoordinate = &[_]ParsedCoordinate{
+        .{
+            .set = "0",
+            .letter = null,
+            .counts = 0,
+            .ltr = .{ .side = .side1, .steps = 0.0, .direction = .on, .yard_line = 40 },
+            .ftb = .{ .steps = 0.0, .direction = .on, .marking = .front_hash },
+        },
+        .{
+            .set = "1",
+            .letter = "A",
+            .counts = 72,
+            .ltr = .{ .side = .side1, .steps = 0.0, .direction = .on, .yard_line = 40 },
+            .ftb = .{ .steps = 0.0, .direction = .on, .marking = .front_hash },
+        },
+        .{
+            .set = "2",
+            .letter = null,
+            .counts = 16,
+            .ltr = .{ .side = .side1, .steps = 3.0, .direction = .outside, .yard_line = 50 },
+            .ftb = .{ .steps = 9.0, .direction = .in_front_of, .marking = .front_hash },
+        },
+        .{
+            .set = "3B",
+            .letter = null,
+            .counts = 24,
+            .ltr = .{ .side = .side1, .steps = 0.0, .direction = .on, .yard_line = 40 },
+            .ftb = .{ .steps = 1.0, .direction = .behind, .marking = .front_side_line },
+        },
+        .{
+            .set = "4",
+            .letter = "C",
+            .counts = 16,
+            .ltr = .{ .side = .side1, .steps = 2.25, .direction = .inside, .yard_line = 30 },
+            .ftb = .{ .steps = 3.75, .direction = .behind, .marking = .front_side_line },
+        },
+        .{
+            .set = "5",
+            .letter = null,
+            .counts = 8,
+            .ltr = .{ .side = .side1, .steps = 1.75, .direction = .inside, .yard_line = 35 },
+            .ftb = .{ .steps = 0.75, .direction = .in_front_of, .marking = .front_side_line },
+        },
+        .{
+            .set = "7A",
+            .letter = null,
+            .counts = 8,
+            .ltr = .{ .side = .middle, .steps = 0.0, .direction = .on, .yard_line = 50 },
+            .ftb = .{ .steps = 4.0, .direction = .behind, .marking = .front_side_line },
+        },
+        .{
+            .set = "8",
+            .letter = null,
+            .counts = 10,
+            .ltr = .{ .side = .side2, .steps = 1.5, .direction = .inside, .yard_line = 45 },
+            .ftb = .{ .steps = 6.25, .direction = .behind, .marking = .front_side_line },
+        },
+        .{
+            .set = "16",
+            .letter = null,
+            .counts = 16,
+            .ltr = .{ .side = .middle, .steps = 0.0, .direction = .on, .yard_line = 50 },
+            .ftb = .{ .steps = 1.0, .direction = .behind, .marking = .front_side_line },
+        },
+    };
+    for (exps, acts) |exp, act| {
+        try std.testing.expectEqualDeep(exp, act);
     }
 }
 
@@ -362,66 +455,77 @@ pub fn main() !void {
     // C1,2,,16,Side 1: 3.0 steps outside 50 yd ln,9.0 steps in front of Front Hash (HS)
     const clarinet = dots.Section{ .symbol = "C", .name = "clarinet" };
     const c1 = dots.Performer{ .section = clarinet, .number = 1 };
-    const coords = &[_]dots.Dot{
-        dot(c1, .ltr(0.0, .inside, .side1, 40), .ftb(0.0, .in_front_of, .front_hash)),
-        dot(c1, .ltr(0.0, .inside, .side1, 40), .ftb(0.0, .in_front_of, .front_hash)),
-        dot(c1, .ltr(3.0, .outside, .side1, 50), .ftb(9.0, .in_front_of, .front_hash)),
-        dot(c1, .ltr(0.0, .inside, .side1, 40), .ftb(1.0, .behind, .front_side_line)),
-        dot(c1, .ltr(0.0, .inside, .side1, 40), .ftb(1.0, .behind, .front_side_line)),
-        dot(c1, .ltr(0.0, .inside, .side1, 40), .ftb(1.0, .behind, .front_side_line)),
-        dot(c1, .ltr(2.25, .inside, .side1, 30), .ftb(3.75, .behind, .front_side_line)),
-        dot(c1, .ltr(1.75, .inside, .side1, 35), .ftb(0.75, .in_front_of, .front_side_line)),
-        dot(c1, .ltr(2.75, .inside, .side1, 40), .ftb(0.25, .behind, .front_side_line)),
-        dot(c1, .ltr(0.0, .inside, .side1, 45), .ftb(0.0, .in_front_of, .front_side_line)),
-        dot(c1, .ltr(0.0, .inside, .side1, 50), .ftb(4.0, .behind, .front_side_line)),
-        dot(c1, .ltr(1.5, .inside, .side2, 45), .ftb(6.25, .behind, .front_side_line)),
-        dot(c1, .ltr(1.5, .inside, .side2, 45), .ftb(6.25, .behind, .front_side_line)),
-        dot(c1, .ltr(1.5, .inside, .side2, 45), .ftb(6.25, .behind, .front_side_line)),
-        dot(c1, .ltr(0.0, .inside, .side2, 45), .ftb(10.0, .behind, .front_side_line)),
-        dot(c1, .ltr(0.0, .inside, .side1, 45), .ftb(4.0, .behind, .front_side_line)),
-        dot(c1, .ltr(2.0, .outside, .side1, 35), .ftb(8.0, .behind, .front_side_line)),
-        dot(c1, .ltr(2.0, .outside, .side1, 35), .ftb(8.0, .behind, .front_side_line)),
-        dot(c1, .ltr(2.0, .outside, .side1, 35), .ftb(8.0, .behind, .front_side_line)),
-        dot(c1, .ltr(0.0, .inside, .side1, 45), .ftb(0.0, .in_front_of, .front_side_line)),
-        dot(c1, .ltr(0.0, .inside, .side1, 50), .ftb(1.0, .behind, .front_side_line)),
-        dot(c1, .ltr(0.0, .inside, .side1, 50), .ftb(1.0, .behind, .front_side_line)),
-        dot(c1, .ltr(0.0, .inside, .side1, 50), .ftb(1.0, .behind, .front_side_line)),
-        dot(c1, .ltr(0.0, .inside, .side1, 50), .ftb(1.0, .behind, .front_side_line)),
-        dot(c1, .ltr(1.75, .outside, .side1, 50), .ftb(0.25, .in_front_of, .front_side_line)),
-        dot(c1, .ltr(1.25, .inside, .side2, 45), .ftb(13.25, .in_front_of, .front_hash)),
-        dot(c1, .ltr(3.5, .outside, .side2, 40), .ftb(4.25, .behind, .front_hash)),
-        dot(c1, .ltr(3.5, .outside, .side2, 40), .ftb(4.25, .behind, .front_hash)),
-        dot(c1, .ltr(4.0, .outside, .side2, 35), .ftb(4.0, .in_front_of, .front_hash)),
-        dot(c1, .ltr(4.0, .outside, .side2, 35), .ftb(4.0, .in_front_of, .front_hash)),
-        dot(c1, .ltr(2.0, .inside, .side2, 30), .ftb(2.0, .in_front_of, .front_hash)),
-        dot(c1, .ltr(2.0, .inside, .side2, 30), .ftb(2.0, .in_front_of, .front_hash)),
-        dot(c1, .ltr(4.0, .outside, .side2, 35), .ftb(0.0, .in_front_of, .front_hash)),
-        dot(c1, .ltr(2.0, .inside, .side2, 30), .ftb(4.0, .behind, .front_hash)),
-        dot(c1, .ltr(3.0, .outside, .side2, 30), .ftb(2.0, .in_front_of, .front_hash)),
-        dot(c1, .ltr(0.0, .inside, .side2, 25), .ftb(8.0, .in_front_of, .front_hash)),
-        dot(c1, .ltr(3.75, .inside, .side2, 20), .ftb(13.25, .behind, .front_side_line)),
-        dot(c1, .ltr(1.0, .outside, .side2, 20), .ftb(6.5, .behind, .front_side_line)),
-        dot(c1, .ltr(1.0, .outside, .side2, 20), .ftb(6.5, .behind, .front_side_line)),
-        dot(c1, .ltr(3.25, .outside, .side2, 20), .ftb(6.5, .behind, .front_side_line)),
-        dot(c1, .ltr(3.25, .outside, .side2, 20), .ftb(6.5, .behind, .front_side_line)),
-        dot(c1, .ltr(4.0, .outside, .side2, 20), .ftb(7.0, .in_front_of, .front_hash)),
-        dot(c1, .ltr(4.0, .outside, .side2, 20), .ftb(7.0, .in_front_of, .front_hash)),
-        dot(c1, .ltr(1.0, .inside, .side2, 20), .ftb(4.0, .behind, .front_side_line)),
-        dot(c1, .ltr(1.0, .inside, .side2, 20), .ftb(4.0, .behind, .front_side_line)),
-        dot(c1, .ltr(3.0, .inside, .side2, 25), .ftb(1.0, .behind, .front_side_line)),
-        dot(c1, .ltr(3.0, .inside, .side2, 25), .ftb(1.0, .behind, .front_side_line)),
-        dot(c1, .ltr(3.0, .inside, .side2, 25), .ftb(1.0, .behind, .front_side_line)),
-        dot(c1, .ltr(3.0, .inside, .side2, 25), .ftb(1.0, .behind, .front_side_line)),
-        dot(c1, .ltr(3.0, .inside, .side2, 25), .ftb(1.0, .behind, .front_side_line)),
-        dot(c1, .ltr(0.0, .inside, .side2, 30), .ftb(2.0, .in_front_of, .front_side_line)),
-        dot(c1, .ltr(0.0, .inside, .side2, 30), .ftb(2.0, .in_front_of, .front_side_line)),
-    };
-    try stdout.print(
-        "<svg viewBox=\"{} {} {} {}\" xmlns=\"http://www.w3.org/2000/svg\">\n",
-        .{ -1000, -500, 2000, 1000 },
-        // .{ -pixel.ratio.x, pixel.ratio.y, pixel.ratio.x * 2, -pixel.ratio.y * 2 },
+    var s = std.Io.Reader.fixed(
+        \\0 0 Side 1: On 40 yd ln On Front Hash (HS)
+        \\1 A 72 Side 1: On 40 yd ln On Front Hash (HS)
+        \\2 16 Side 1: 3.0 steps outside 50 yd ln 9.0 steps in front of Front Hash (HS)
+        \\3 18 Side 1: On 40 yd ln 1.0 steps behind Front side line
+        \\3A B 8 Side 1: On 40 yd ln 1.0 steps behind Front side line
+        \\3B 24 Side 1: On 40 yd ln 1.0 steps behind Front side line
+        \\4 C 16 Side 1: 2.25 steps inside 30 yd ln 3.75 steps behind Front side line
+        \\5 8 Side 1: 1.75 steps inside 35 yd ln 0.75 steps in front of Front side line
+        \\6 8 Side 1: 2.75 steps inside 40 yd ln 0.25 steps behind Front side line
+        \\7 8 Side 1: On 45 yd ln On Front side line
+        \\7A 8 Side 1: On 50 yd ln 4.0 steps behind Front side line
+        \\8 10 Side 2: 1.5 steps inside 45 yd ln 6.25 steps behind Front side line
+        \\9 16 Side 2: 1.5 steps inside 45 yd ln 6.25 steps behind Front side line
+        \\9 0 Side 2: 1.5 steps inside 45 yd ln 6.25 steps behind Front side line
+        \\10 12 Side 2: On 45 yd ln 10.0 steps behind Front side line
+        \\11 16 Side 1: On 45 yd ln 4.0 steps behind Front side line
+        \\12 D 16 Side 1: 2.0 steps outside 35 yd ln 8.0 steps behind Front side line
+        \\13 12 Side 1: 2.0 steps outside 35 yd ln 8.0 steps behind Front side line
+        \\13A E 12 Side 1: 2.0 steps outside 35 yd ln 8.0 steps behind Front side line
+        \\14 16 Side 1: On 45 yd ln On Front side line
+        \\15 F 16 On 50 yd ln 1.0 steps behind Front side line
+        \\16 16 On 50 yd ln 1.0 steps behind Front side line
+        \\17 12 On 50 yd ln 1.0 steps behind Front side line
+        \\18 G 8 On 50 yd ln 1.0 steps behind Front side line
+        \\19 H 16 Side 1: 1.75 steps outside 50 yd ln 0.25 steps in front of Front side line
+        \\20 16 Side 2: 1.25 steps inside 45 yd ln 13.25 steps in front of Front Hash (HS)
+        \\21 16 Side 2: 3.5 steps outside 40 yd ln 4.25 steps behind Front Hash (HS)
+        \\21A I 12 Side 2: 3.5 steps outside 40 yd ln 4.25 steps behind Front Hash (HS)
+        \\22 16 Side 2: 4.0 steps outside 35 yd ln 4.0 steps in front of Front Hash (HS)
+        \\22A 39 Side 2: 4.0 steps outside 35 yd ln 4.0 steps in front of Front Hash (HS)
+        \\23 8 Side 2: 2.0 steps inside 30 yd ln 2.0 steps in front of Front Hash (HS)
+        \\24 8 Side 2: 2.0 steps inside 30 yd ln 2.0 steps in front of Front Hash (HS)
+        \\25 8 Side 2: 4.0 steps outside 35 yd ln On Front Hash (HS)
+        \\26 8 Side 2: 2.0 steps inside 30 yd ln 4.0 steps behind Front Hash (HS)
+        \\26A 8 Side 2: 3.0 steps outside 30 yd ln 2.0 steps in front of Front Hash (HS)
+        \\27 8 Side 2: On 25 yd ln 8.0 steps in front of Front Hash (HS)
+        \\27A 8 Side 2: 3.75 steps inside 20 yd ln 13.25 steps behind Front side line
+        \\28 8 Side 2: 1.0 steps outside 20 yd ln 6.5 steps behind Front side line
+        \\28A 16 Side 2: 1.0 steps outside 20 yd ln 6.5 steps behind Front side line
+        \\29 0 Side 2: 3.25 steps outside 20 yd ln 6.5 steps behind Front side line
+        \\29A 4 Side 2: 3.25 steps outside 20 yd ln 6.5 steps behind Front side line
+        \\30 16 Side 2: 4.0 steps outside 20 yd ln 7.0 steps in front of Front Hash (HS)
+        \\31 8 Side 2: 4.0 steps outside 20 yd ln 7.0 steps in front of Front Hash (HS)
+        \\32 8 Side 2: 1.0 steps inside 20 yd ln 4.0 steps behind Front side line
+        \\32A 8 Side 2: 1.0 steps inside 20 yd ln 4.0 steps behind Front side line
+        \\33 8 Side 2: 3.0 steps inside 25 yd ln 1.0 steps behind Front side line
+        \\33A 22 Side 2: 3.0 steps inside 25 yd ln 1.0 steps behind Front side line
+        \\34 16 Side 2: 3.0 steps inside 25 yd ln 1.0 steps behind Front side line
+        \\34A 4 Side 2: 3.0 steps inside 25 yd ln 1.0 steps behind Front side line
+        \\35 16 Side 2: 3.0 steps inside 25 yd ln 1.0 steps behind Front side line
+        \\36 16 Side 2: On 30 yd ln 2.0 steps in front of Front side line
+        \\36A 38 Side 2: On 30 yd ln 2.0 steps in front of Front side line
     );
-    try stdout.print("<style> svg {{ background-color: gray; }}</style>\n", .{});
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var doc = try xml.Document.init(allocator, stdout, .pretty);
+
+    try doc.open(.svg, .{
+        .version = "1.1",
+        .viewBox = xml.lazy("{} {} {} {}", .{ -1000, -500, 2000, 1000 }),
+        .xmlns = "http://www.w3.org/2000/svg",
+    });
+
+    try doc.open(.style, .{});
+    try doc.printIndent();
+    _ = try doc.writer.write("svg { background-color: gray; stroke: black }\n");
+    try doc.close();
     const back = pixel.translateYTo(1.0);
     // const back_hash = pixel.translateYTo(1.0 - FrontToBack.hash_dy);
     const front = pixel.translateYTo(-1.0);
@@ -429,45 +533,45 @@ pub fn main() !void {
     const left = pixel.translateXTo(-1.0);
     const right = pixel.translateXTo(1.0);
     // Back side line
-    try stdout.print("{f}\n", .{fmtAlt(printLine, .{ dots.Coordinate{ .x = left, .y = back }, dots.Coordinate{ .x = right, .y = back } })});
-    // try stdout.print("{f}\n", .{fmtAlt(printLine, .{ dots.Coordinate{ .x = left, .y = back_hash }, dots.Coordinate{ .x = right, .y = back_hash } })});
+    try doc.selfClose(.line, .{ .x1 = left, .y1 = back, .x2 = right, .y2 = back });
     // Front side line
-    try stdout.print("{f}\n", .{fmtAlt(printLine, .{ dots.Coordinate{ .x = left, .y = front }, dots.Coordinate{ .x = right, .y = front } })});
-    // try stdout.print("{f}\n", .{fmtAlt(printLine, .{ dots.Coordinate{ .x = left, .y = front_hash }, dots.Coordinate{ .x = right, .y = front_hash } })});
-    // Side 1 goal line
-    try stdout.print("{f}\n", .{fmtAlt(printLine, .{ dots.Coordinate{ .x = left, .y = back }, dots.Coordinate{ .x = left, .y = front } })});
-    // Side 2 goal line
-    try stdout.print("{f}\n", .{fmtAlt(printLine, .{ dots.Coordinate{ .x = right, .y = back }, dots.Coordinate{ .x = right, .y = front } })});
+    try doc.selfClose(.line, .{ .x1 = left, .y1 = front, .x2 = right, .y2 = front });
     // 50 yard line
-    try stdout.print("{f}\n", .{fmtAlt(printLine, .{ dots.Coordinate{ .x = 0, .y = back }, dots.Coordinate{ .x = 0, .y = front } })});
-    for (1..10) |i| {
-        try stdout.print("<g transform=\"translate({}, 0)\">\n{f}</g>", .{
-            dots.Scale.translateX(.foot, pixel, @as(f64, @floatFromInt(i * 15))),
-            fmtAlt(printLine, .{ dots.Coordinate{ .x = 0, .y = back }, dots.Coordinate{ .x = 0, .y = front } }),
-        });
-        try stdout.print("<g transform=\"translate({}, 0)\">\n{f}</g>", .{
-            dots.Scale.translateX(.foot, pixel, -@as(f64, @floatFromInt(i * 15))),
-            fmtAlt(printLine, .{ dots.Coordinate{ .x = 0, .y = back }, dots.Coordinate{ .x = 0, .y = front } }),
-        });
+    try doc.selfClose(.line, .{ .x1 = 0, .y1 = back, .x2 = 0, .y2 = front });
+    // 45 down to 0 yard line.
+    for (1..11) |i| {
+        const pixel_dx = dots.Scale.translateX(.foot, pixel, @as(f64, @floatFromInt(i * 15)));
+        try doc.selfClose(.line, .{ .x1 = pixel_dx, .y1 = back, .x2 = pixel_dx, .y2 = front });
+        try doc.selfClose(.line, .{ .x1 = -pixel_dx, .y1 = back, .x2 = -pixel_dx, .y2 = front });
     }
-    std.debug.print("    dx     dy   dist\n", .{});
-    for (coords[0 .. coords.len - 1], coords[1..]) |d0, d1| {
-        const dx = dots.Scale.step.translateXTo(d1.coordinate.x - d0.coordinate.x);
-        const dy = dots.Scale.step.translateYTo(d1.coordinate.y - d0.coordinate.y);
-        std.debug.print("{:6.2} {:6.2} {:6.2}\n", .{ dx, dy, std.math.sqrt(dx * dx + dy * dy) });
-        const coord0 = pixel.translateTo(d0.coordinate);
-        const coord1 = pixel.translateTo(d1.coordinate);
-        try stdout.print("<line x1=\"{}\" y1=\"{}\" x2=\"{}\" y2=\"{}\" stroke=\"black\"/>\n", .{ coord0.x, coord0.y, coord1.x, coord1.y });
-    }
-    // var show = dots.Show{
-    //     .coordinates = coords,
-    // };
 
-    for (coords) |d| {
-        const c = pixel.translateTo(d.coordinate);
-        try stdout.print("<g transform=\"translate({}, {})\">\n{f}</g>\n", .{ c.x, c.y, fmtAlt(printDot, d) });
+    const coords = try parseCoordinates(allocator, &s);
+    var prev: ?dots.Coordinate = null;
+    _ = c1;
+    for (coords) |*coord| {
+        const c = pixel.translateTo(coord.canonical());
+        try doc.open(.g, .{ .transform = xml.lazy("translate({}, {})", .{ c.x, c.y }) });
+        try doc.selfClose(.circle, .{ .r = 2, .fill = "black" });
+        // Translate the text and the line connecting it to the dot together.
+        try doc.open(.g, .{ .transform = xml.lazy("translate({}, {})", .{ 14, 26 }) });
+        try doc.selfClose(.line, .{ .x1 = -10, .y1 = -22, .x2 = 0, .y2 = -12 });
+        try doc.printIndent();
+        doc.format = .compact;
+        // Print the set name
+        try doc.open(.text, .{});
+        _ = try doc.writer.write(coord.set);
+        try doc.close(); // text
+        try doc.writer.writeByte('\n');
+        doc.format = .pretty;
+        // Close translated line and text.
+        try doc.close(); // g
+        try doc.close();
+        if (prev) |p| {
+            try doc.selfClose(.line, .{ .x1 = p.x, .y1 = p.y, .x2 = c.x, .y2 = c.y });
+        }
+        prev = c;
     }
-    try stdout.print("</svg>\n", .{});
+    try doc.close();
 
     try stdout.flush(); // Don't forget to flush!
 }
